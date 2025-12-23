@@ -1,4 +1,5 @@
-# Computational analysis of gene-expression asthma biomarkers: predicting severity, cellular specificity and drug identification
+# Using cell-specific late-phase asthma mRNA biomarkers to repurpose drugs that concurrently reverse disease signatures across multiple immune cell-types
+
 
 *reproduce all analyses using this codebase*
 
@@ -37,7 +38,7 @@ git clone https://github.com/CompBio-Lab/asthma_LAR-mRNA_biomarkers.git
 ```
 
 ### 2) get data
-> download data from this [zenodo link]()
+> download data from this [zenodo link](10.5281/zenodo.18034997)
 > put data in asthma_LAR-mRNA_biomarkers folder
 
 ### 3) open .Rproj file
