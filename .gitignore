@@ -55,7 +55,20 @@ renv/staging/
 # project folders and files
 .DS_Store
 data/
+src/*_cache/
+src/*_files/
 **.zip
 adata/
 doc/
-results/
+figures/old/
+reviews/
+
+# Ignore everything under results/
+results/**
+
+# Re-include directories so Git can see files inside them
+!results/**/
+
+# Keep all .rds files
+!results/**/*.rds
+

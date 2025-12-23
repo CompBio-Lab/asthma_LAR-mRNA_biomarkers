@@ -1,0 +1,784 @@
+---
+title: "validation of late phase biomarkers"
+author: "Mingming Zhang & Amrit Singh"
+date: "December 22, 2025"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Setup: Libraries and utilities
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)     # dplyr, tidyr, ggplot2, stringr, etc.
+library(nlme)          # linear mixed-effects models
+library(limma)         # differential expression
+library(mixOmics)      # PLS-DA
+library(ComplexHeatmap)# heatmaps
+library(here)          # file paths
+library(enrichR)       # enrichment analysis
+library(ggrepel)
+library(UpSetR)
+library(cowplot)
+
+source(here::here("src", "utils", "test_biomarkers.R"))
+source(here::here("src", "utils", "zip_nPure.R"))
+source(here::here("src", "utils", "customTheme.R"))
+source(here::here("src", "utils", "run_lme.R"))
+source(here::here("src", "utils", "RF.R"))
+source(here::here("src", "utils", "PLSDA.R"))
+source(here::here("src", "utils", "plot_gene_sex_lme.R"))
+source(here::here("src", "utils", "plot_varimp_pathways.R"))
+```
+
+## Import data
+
+```{r import_validation_inputs}
+latephase_exacer_biomarkers <- readRDS(here::here("results", "latephase_exacer_biomarkers.rds"))
+load(here::here("data", "preprocessedData", "geodatasets.RDATA"))
+
+## samples in each dataset
+table(phenoDataList$GSE19301$phenotype)
+
+all(colnames(esetList$GSE19301) == rownames(phenoDataList$GSE19301))
+geoPanelGenes <- as.data.frame(t(esetList$GSE19301))
+geoPanelGenes <- geoPanelGenes[, intersect(colnames(geoPanelGenes), latephase_exacer_biomarkers)]
+
+geoPanelGenes <- add_column(geoPanelGenes, donor = phenoDataList$GSE19301$donor, .before = 1)
+geoPanelGenes <- add_column(geoPanelGenes, sex = phenoDataList$GSE19301$sex, .before = 1)
+geoPanelGenes <- add_column(geoPanelGenes, phenotype = phenoDataList$GSE19301$phenotype, .before = 1)
+```
+
+## Exacerbation dataset (GSE19301)
+
+```{r lme_exacerbation_by_severity}
+mod_exacer <- run_lme(
+  data = geoPanelGenes[phenoDataList$GSE19301$severity == "Moderate Persistent", ],
+  fdr = 0.1
+)
+mod_exacer$severity <- "Moderate Persistent"
+
+sev_exacer <- run_lme(
+  data = geoPanelGenes[phenoDataList$GSE19301$severity == "Severe Persistent", ],
+  fdr = 0.1
+)
+sev_exacer$severity <- "Severe Persistent"
+
+exacer <- rbind(mod_exacer, sev_exacer)
+```
+
+## Volcano plot (exacerbation contrasts)
+
+```{r volcano_exacerbation_gse19301, fig.width=10, fig.height=6}
+scaleFUN <- function(x) sprintf("%.0f", x)
+
+exacer$logPval <- -log10(exacer$`p-value`)
+exacer$Sig <- ifelse(exacer$adj.P.Val < 0.1, "FDR<10%", "NotSignificant")
+
+gg1 <- ggplot(exacer, aes(x = Value, y = logPval, color = Sig)) +
+  geom_point(size = 2) +
+  geom_vline(aes(xintercept = 0), lty = 2, color = "gray") +
+  geom_text_repel(
+    data = filter(exacer, adj.P.Val < 0.1),
+    aes(label = feature),
+    size = 2,
+    max.overlaps = 100
+  ) +
+  customTheme(
+    sizeStripFont = 8, xAngle = 0, hjust = 0.5, vjust = 0.5,
+    xSize = 8, ySize = 8, xAxisSize = 8, yAxisSize = 8
+  ) +
+  scale_x_continuous(expression("log"[2]~"fold-change")) +
+  scale_y_continuous(expression("-log"[10]~"P-value"), labels = scaleFUN) +
+  scale_color_manual(values = c("blue", "gray")) +
+  ggtitle("PBMCs - GSE19301") +
+  theme(legend.position = "bottom") +
+  facet_grid(contrast ~ severity, scales = "free")
+
+gg1
+```
+
+## Summarize significant hits (exacerbation)
+
+```{r summarize_significant_exacerbation_hits}
+exacer %>%
+  group_by(severity, contrast, fc) %>%
+  filter(adj.P.Val < 0.1) %>%
+  summarise(n = n())
+
+exacer %>%
+  group_by(severity, contrast, fc) %>%
+  filter(adj.P.Val < 0.1) %>%
+  filter(severity == "Severe Persistent", contrast == "Exacer - Quiet", fc == "DOWN") %>%
+  pull(feature)
+```
+
+## External validation datasets (airway/blood/sputum/BALF)
+
+```{r test_biomarkers_external_gse_panels}
+select_gse <- c("GSE69683", "GSE74986", "GSE147878+GSE161245", "GSE76262+GSE147880")
+
+result <- mapply(function(x, y, z, tis) {
+  res <- test_biomarkers(eset = x, pheno = y, biomarkers = latephase_exacer_biomarkers)
+  res$GSE <- z
+  res$tissue <- tis
+  res
+},
+x = esetList[select_gse],
+y = phenoDataList[select_gse],
+z = select_gse,
+tis = sapply(phenoDataList[select_gse], function(i) unique(i$sampletype)),
+SIMPLIFY = FALSE) %>%
+  do.call(rbind, .) %>%
+  mutate(fc = ifelse(logFC > 0, "UP", "DOWN"))
+
+## number of patients
+table(phenoDataList$GSE19301$severity, phenoDataList$GSE19301$phenotype)
+length(unique(phenoDataList$GSE19301$donor[phenoDataList$GSE19301$severity == "Mild Persistent"]))
+length(unique(phenoDataList$GSE19301$donor[phenoDataList$GSE19301$severity == "Moderate Persistent"]))
+length(unique(phenoDataList$GSE19301$donor[phenoDataList$GSE19301$severity == "Severe Persistent"]))
+rowSums(sapply(phenoDataList[select_gse], function(i) table(i$phenotype)))
+```
+
+## GSE19301 individuals by sex and severity
+
+```{r cohort_table_gse19301_by_sex_severity}
+phenoDataList$GSE19301 %>%
+  filter(severity != "Mild Persistent") %>%
+  group_by(donor) %>%
+  dplyr::slice(1) %>%
+  group_by(sex, severity) %>%
+  summarise(n = n()) %>%
+  tidyr::spread(sex, n) %>%
+  mutate(total = `M` + `F`) %>%
+  mutate(percent_f = 100 * signif(`F` / total, 2)) %>%
+  mutate(total_percentf = paste0(total, " (", percent_f, "%)"))
+```
+
+## Validation datasets individuals by sex and phenotype
+
+```{r cohort_table_validation_gse_by_sex_phenotype}
+a <- data.frame(sampletype = sapply(phenoDataList[select_gse], function(i) unique(i$sampletype))) %>%
+  mutate(gse = rownames(.))
+
+b <- lapply(select_gse, function(i) {
+  df <- as.data.frame(table(phenoDataList[[i]]$sex, phenoDataList[[i]]$phenotype))
+  df$gse <- i
+  df
+}) %>%
+  do.call(rbind, .) %>%
+  tidyr::spread(Var1, Freq) %>%
+  mutate(total = `F` + `M`) %>%
+  mutate(percent_f = 100 * signif(`F` / total, 2))
+
+inner_join(a, b, by = "gse") %>%
+  mutate(gse_sample = paste0(sampletype, " (", gse, ")")) %>%
+  mutate(total_percentf = paste0(total, " (", percent_f, "%)")) %>%
+  dplyr::select(Var2, gse_sample, total_percentf) %>%
+  tidyr::spread(gse_sample, total_percentf)
+```
+
+## Volcano plots across validation datasets
+
+```{r volcano_external_validation, fig.width=8, fig.height=11}
+df <- result %>%
+  mutate(sig = -log10(P.Value)) %>%
+  mutate(Significance = ifelse(adj.P.Val < 0.1, "FDR<10%", "NotSignificant")) %>%
+  mutate(tissue_gse = paste(tissue, GSE, sep = "_"))
+
+p <- df %>%
+  ggplot(aes(x = logFC, y = sig, col = Significance)) +
+  geom_point() +
+  ggh4x::facet_grid2(vars(tissue_gse), vars(contrast),
+                     scales = "free", independent = "all") +
+  scale_color_manual(values = c("blue", "gray")) +
+  ggrepel::geom_text_repel(
+    data = subset(df, adj.P.Val < 0.1),
+    aes(label = feature), size = 2, max.overlaps = 20
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme(legend.position = "top") +
+  customTheme(
+    sizeStripFont = 8, xAngle = 0, hjust = 0.5, vjust = 0.5,
+    xSize = 8, ySize = 8, xAxisSize = 8, yAxisSize = 8
+  ) +
+  xlab(expression("log"[2]~"fold-change")) +
+  ylab(expression("-log"[10]~"P-value"))
+
+ggsave(
+  here::here("results", "validation_of_late_phase_biomarkers_volcanoplots.png"),
+  p, height = 11, width = 8
+)
+
+p
+```
+
+## Summarize significant hits (external validation)
+
+```{r summarize_significant_external_hits}
+result %>%
+  group_by(tissue, contrast, fc) %>%
+  filter(adj.P.Val < 0.1) %>%
+  summarise(n = n()) %>%
+  tidyr::spread(fc, n)
+```
+
+## Overlap of significant genes (UpSet)
+
+```{r upset_overlap_significant_genes}
+sig_result <- subset(result, adj.P.Val < 0.1)
+sig_exacer <- subset(exacer, adj.P.Val < 0.1)
+
+df_exacer <- data.frame(
+  panel = paste0(sig_exacer$contrast, " (", sig_exacer$severity, sig_exacer$tissue, "-", sig_exacer$GSE, ")"),
+  feature = sig_exacer$feature
+)
+
+df_sev <- data.frame(
+  panel = paste0(sig_result$contrast, " (", sig_result$tissue, "-", sig_result$GSE, ")"),
+  feature = sig_result$feature
+)
+
+sigfeat1 <- split(df_exacer$feature, df_exacer$panel)
+upset(fromList(sigfeat1), nsets = length(sigfeat1))
+
+sigfeat2 <- split(df_sev$feature, df_sev$panel)
+upset(fromList(sigfeat2), nsets = length(sigfeat2))
+
+upset(fromList(c(sigfeat1, sigfeat2)), nsets = length(sigfeat1) + length(sigfeat2))
+```
+
+# Exacerbation analysis
+
+## Train PLS-DA models (exacerbation)
+
+```{r train_plsda_exacerbation_models}
+latephase_biomarkers <- readRDS(here::here("results", "latephase_biomarkers.rds"))
+latephase_biomarkers$all <- latephase_exacer_biomarkers
+# exacer_plsda <- lapply(names(latephase_biomarkers), function(i){
+#   biomarkers <- latephase_biomarkers[[i]]
+#   ## all subjects
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_all_mod <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_all_mod$df$comparison <- paste(exacer_all_mod$df$comparison, "(Moderate Persistent)")
+#   exacer_all_mod$feat$comparison <- paste(exacer_all_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_all_mod$df$sex <- exacer_all_mod$feat$sex <- "M+F"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_all_sev <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_all_sev$df$comparison <- paste(exacer_all_sev$df$comparison, "(Severe Persistent)")
+#     exacer_all_sev$feat$comparison <- paste(exacer_all_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_all_sev$df$sex <- exacer_all_sev$feat$sex <- "M+F"
+# 
+#   ## females
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent" & sex ==  "F")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_f_mod <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_f_mod$df$comparison <- paste(exacer_f_mod$df$comparison, "(Moderate Persistent)")
+#   exacer_f_mod$feat$comparison <- paste(exacer_f_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_f_mod$df$sex <- exacer_f_mod$feat$sex <- "F"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent" & sex ==  "F")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_f_sev <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_f_sev$df$comparison <- paste(exacer_f_sev$df$comp, "(Severe Persistent)")
+#     exacer_f_sev$feat$comparison <- paste(exacer_f_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_f_sev$df$sex <- exacer_f_sev$feat$sex <- "F"
+# 
+#   ## males
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent" & sex ==  "M")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_m_mod <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_m_mod$df$comparison <- paste(exacer_m_mod$df$comparison, "(Moderate Persistent)")
+#     exacer_m_mod$feat$comparison <- paste(exacer_m_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_m_mod$df$sex <- exacer_m_mod$feat$sex <- "M"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent" & sex ==  "M")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_m_sev <- multilevel_plsda(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_m_sev$df$comparison <- paste(exacer_m_sev$df$comparison, "(Severe Persistent)")
+#     exacer_m_sev$feat$comparison <- paste(exacer_m_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_m_sev$df$sex <- exacer_m_sev$feat$sex <- "M"
+# 
+#   exacer_df <- rbind(exacer_all_mod$df, exacer_all_sev$df,
+#                   exacer_f_mod$df, exacer_f_sev$df,
+#                   exacer_m_mod$df, exacer_m_sev$df)
+#   exacer_feat <- rbind(exacer_all_mod$feat, exacer_all_sev$feat,
+#                 exacer_f_mod$feat, exacer_f_sev$feat,
+#                 exacer_m_mod$feat, exacer_m_sev$feat)
+#   exacer_df$panel <- exacer_feat$panel <- i
+#   list(df = exacer_df, feat = exacer_feat)
+# }) %>%
+#   zip_nPure()
+# saveRDS(exacer_plsda, here("results", "exacer_plsda.rds"))
+```
+
+## Train RF models (exacerbation)
+
+```{r train_rf_exacerbation_models}
+# exacer_rf <- lapply(names(latephase_biomarkers), function(i){
+#   biomarkers <- latephase_biomarkers[[i]]
+#   ## all subjects
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_all_mod <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers, workers = 8)
+#   exacer_all_mod$df$comparison <- paste(exacer_all_mod$df$comparison , "(Moderate Persistent)")
+#   exacer_all_mod$feat$comparison <- paste(exacer_all_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_all_mod$df$sex <- exacer_all_mod$feat$sex <- "M+F"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_all_sev <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_all_sev$df$comparison <- paste(exacer_all_sev$df$comparison, "(Severe Persistent)")
+#   exacer_all_sev$feat$comparison <- paste(exacer_all_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_all_sev$df$sex <- exacer_all_sev$feat$sex <- "M+F"
+# 
+#   ## females
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent" & sex ==  "F")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_f_mod <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers, workers = 8)
+#   exacer_f_mod$df$comparison <- paste(exacer_f_mod$df$comparison, "(Moderate Persistent)")
+#   exacer_f_mod$feat$comparison <- paste(exacer_f_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_f_mod$df$sex <- exacer_f_mod$feat$sex <- "F"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent" & sex ==  "F")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_f_sev <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_f_sev$df$comparison <- paste(exacer_f_sev$df$comparison, "(Severe Persistent)")
+#   exacer_f_sev$feat$comparison <- paste(exacer_f_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_f_sev$df$sex <- exacer_f_sev$feat$sex <- "F"
+# 
+#   ## males
+#   demo <- subset(phenoDataList$GSE19301, severity == "Moderate Persistent" & sex ==  "M")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_m_mod <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers, workers = 8)
+#   exacer_m_mod$df$comparison <- paste(exacer_m_mod$df$comparison, "(Moderate Persistent)")
+#   exacer_m_mod$feat$comparison <- paste(exacer_m_mod$feat$comparison, "(Moderate Persistent)")
+#   exacer_m_mod$df$sex <- exacer_m_mod$feat$sex <- "M"
+#   demo <- subset(phenoDataList$GSE19301, severity == "Severe Persistent" & sex ==  "M")
+#   eset <- esetList$GSE19301[intersect(rownames(esetList$GSE19301), biomarkers), rownames(demo)]
+#   exacer_m_sev <- multilevel_rf(eset = eset, demo = demo,
+#                    biomarkers = biomarkers)
+#   exacer_m_sev$df$comparison <- paste(exacer_m_sev$df$comparison, "(Severe Persistent)")
+#   exacer_m_sev$feat$comparison <- paste(exacer_m_sev$feat$comparison, "(Severe Persistent)")
+#   exacer_m_sev$df$sex <- exacer_m_sev$feat$sex <- "M"
+# 
+#   exacer_df <- rbind(exacer_all_mod$df, exacer_all_sev$df,
+#                   exacer_f_mod$df, exacer_f_sev$df,
+#                   exacer_m_mod$df, exacer_m_sev$df)
+#   exacer_feat <- rbind(exacer_all_mod$feat, exacer_all_sev$feat,
+#                 exacer_f_mod$feat, exacer_f_sev$feat,
+#                 exacer_m_mod$feat, exacer_m_sev$feat)
+#   exacer_df$panel <- exacer_feat$panel <- i
+#   list(df = exacer_df, feat = exacer_feat)
+# }) %>%
+#   zip_nPure()
+# saveRDS(exacer_rf, here("results", "exacer_rf.rds"))
+```
+
+## Plot model performance heatmap (exacerbation)
+
+```{r plot_exacerbation_model_performance_heatmap}
+exacer_plsda <- readRDS(here("results", "exacer_plsda.rds"))
+exacer_rf <- readRDS(here("results", "exacer_rf.rds"))
+col_names <- intersect(colnames(exacer_rf$df[[1]]), colnames(exacer_plsda$df[[1]]))
+panel_names <- c("all", "panCancer", "UCSC_isoforms", "UCSC", "Ensembl", "Trinity")
+auc <- rbind(do.call(rbind, exacer_rf$df),
+             do.call(rbind, exacer_plsda$df))[, col_names] %>% 
+  filter(stat == "AUC.mean") %>% 
+  dplyr::select(-stat) %>% 
+  mutate(model_panel = paste(model, panel, sep="_")) %>% 
+  dplyr::select(-c(model, panel)) %>% 
+  spread(model_panel, value)
+
+auc2 <- auc[, -c(1:4)]
+classifer <- factor(sapply(strsplit(colnames(auc2), "_"), function(i) i[[1]]),
+                    c("RF", "PLSDA"))
+colnames(auc2) <- sapply(strsplit(colnames(auc2), "_"), function(i) i[[2]])
+row_ha <- rowAnnotation(sampletype=rep("PBMCs", nrow(auc)),
+                        comparison=auc$comparison, 
+                        sex=auc$sex,
+                        col = list(sampletype = c("PBMCs" = "red"),
+                                   comparison = c("Exacer vs. Quiet (Moderate Persistent)"="#DEEBF7", "Exacer vs. Quiet (Severe Persistent)"="#9ECAE1", "Exacer vs. followup (Moderate Persistent)"="#4292C6", "Exacer vs. followup (Severe Persistent)"="#084594"),
+                                   sex = c("F"="#80CDC1","M"="#35978F","M+F"="#01665E")))
+
+h1 <- Heatmap(auc2, column_split = classifer,
+        right_annotation = row_ha, 
+        cluster_columns = TRUE,
+        border = TRUE, name="AUC",
+    cell_fun = function(j, i, x, y, width, height, fill) {
+        if(auc2[i, j] > 0.9) {
+          grid.text("***", x, y, gp = gpar(fontsize = 15))
+        } else if(auc2[i, j] > 0.8) {
+          grid.text("**", x, y, gp = gpar(fontsize = 15))
+        } else if(auc2[i, j] > 0.7) {
+          grid.text("*", x, y, gp = gpar(fontsize = 15))
+        }
+})
+h1
+```
+
+## Summarize model performance table (exacerbation)
+
+```{r summarize_exacerbation_model_performance}
+exacertable <- rbind(do.call(rbind, exacer_plsda$df)[, col_names], 
+                     do.call(rbind, exacer_rf$df)[, col_names]) %>% 
+  mutate(value = signif(value, 2)) %>%  
+  filter(stat == "AUC.mean") %>% 
+  spread(model, value) %>% 
+  filter(PLSDA > 0.7) %>% 
+  filter(RF > 0.7)
+write.csv(exacertable, here::here("results", "exacerbation_models_perfs.csv"))
+
+knitr::kable(exacertable)
+```
+
+## Compile feature importance (exacerbation)
+
+```{r compile_exacerbation_feature_importance}
+selectcols <- intersect(colnames(exacer_plsda$feat[[1]]), colnames(exacer_rf$feat[[1]]))
+exacerfeat <- rbind(do.call(rbind, exacer_plsda$feat)[, selectcols], 
+                     do.call(rbind, exacer_rf$feat)[,selectcols]) %>% 
+  right_join(exacertable, by=c("gse", "comparison", "panel", "sex")) %>% 
+  dplyr::select(-c(stat, PLSDA, RF, sampletype, gse)) %>% 
+  group_by(comparison, panel, sex, model) %>%
+  mutate(rank_pct = percent_rank(importance))
+
+knitr::kable(exacerfeat)
+```
+
+# Asthma severity
+
+## Train PLS-DA models (severity)
+
+```{r train_plsda_severity_models}
+# all_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_plsda(eset_list = esetList, pheno_list = phenoDataList, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]])
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# pheno = lapply(phenoDataList, function(i){subset(i, sex == "F")})
+# f_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_plsda(eset_list = esetList, pheno_list = pheno, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]])
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# pheno = lapply(phenoDataList, function(i){subset(i, sex == "M")})
+# m_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_plsda(eset_list = esetList, pheno_list = pheno, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]])
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# 
+# ## perf
+# sev_plsda_df <- rbind(do.call(rbind, all_sev$df) %>% mutate(sex="M+F"),
+#       do.call(rbind, f_sev$df) %>% mutate(sex="F"),
+#       do.call(rbind, m_sev$df) %>% mutate(sex="M"))
+# sev_plsda_df$sampletype[sev_plsda_df$sampletype == "balf"] <- "BALF"
+# 
+# ## feature importance
+# sev_plsda_feat <- rbind(do.call(rbind, all_sev$feat) %>% mutate(sex="M+F"),
+#       do.call(rbind, f_sev$feat) %>% mutate(sex="F"),
+#       do.call(rbind, m_sev$feat) %>% mutate(sex="M"))
+# sev_plsda_feat$sampletype[sev_plsda_feat$sampletype == "balf"] <- "BALF"
+# sev_plsda <- list(feat = sev_plsda_feat, df = sev_plsda_df)
+# 
+# saveRDS(sev_plsda, here("results", "sev_plsda.rds"))
+```
+
+## Train RF models (severity)
+
+```{r train_rf_severity_models}
+# all_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_rf(eset_list = esetList, pheno_list = phenoDataList, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]], workers = 8)
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# pheno = lapply(phenoDataList, function(i){subset(i, sex == "F")})
+# f_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_rf(eset_list = esetList, pheno_list = pheno, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]], workers = 8)
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# pheno = lapply(phenoDataList, function(i){subset(i, sex == "M")})
+# m_sev <- lapply(names(latephase_biomarkers), function(i){
+#   res <- lar_rf(eset_list = esetList, pheno_list = pheno, gse_list = select_gse,
+#                      biomarkers = latephase_biomarkers[[i]], workers = 8)
+#   list(feat = do.call(rbind, res$feat) %>% mutate(panel = i),
+#        df = do.call(rbind, res$df) %>% mutate(panel = i))
+# }) %>%
+#   zip_nPure()
+# 
+# ## perf
+# sev_rf_df <- rbind(do.call(rbind, all_sev$df) %>% mutate(sex="M+F"),
+#       do.call(rbind, f_sev$df) %>% mutate(sex="F"),
+#       do.call(rbind, m_sev$df) %>% mutate(sex="M"))
+# sev_rf_df$sampletype[sev_rf_df$sampletype == "balf"] <- "BALF"
+# 
+# ## feature importance
+# sev_rf_feat <- rbind(do.call(rbind, all_sev$feat) %>% mutate(sex="M+F"),
+#       do.call(rbind, f_sev$feat) %>% mutate(sex="F"),
+#       do.call(rbind, m_sev$feat) %>% mutate(sex="M"))
+# sev_rf_feat$sampletype[sev_rf_feat$sampletype == "balf"] <- "BALF"
+# sev_rf <- list(feat = sev_rf_feat, df = sev_rf_df)
+# 
+# saveRDS(sev_rf, here("results", "sev_rf.rds"))
+```
+
+## Plot model performance heatmap (severity)
+
+```{r plot_severity_model_performance_heatmap}
+sev_plsda <- readRDS(here("results", "sev_plsda.rds"))
+sev_rf <- readRDS(here("results", "sev_rf.rds"))
+col_names <- intersect(colnames(sev_rf$df), colnames(sev_plsda$df))
+panel_names <- c("all", "panCancer", "UCSC_isoforms", "UCSC", "Ensembl", "Trinity")
+auc <- rbind(sev_rf$df[, col_names],
+             sev_plsda$df[, col_names]) %>% 
+  filter(stat == "AUC.mean") %>% 
+  dplyr::select(-stat) %>% 
+  mutate(model_panel = paste(model, panel, sep="_")) %>% 
+  dplyr::select(-c(model, panel)) %>% 
+  spread(model_panel, value)
+
+auc2 <- auc[, -c(1:4)]
+classifer <- factor(sapply(strsplit(colnames(auc2), "_"), function(i) i[[1]]), 
+                    c("PLSDA", "RF"))
+colnames(auc2) <- sapply(strsplit(colnames(auc2), "_"), function(i) i[[2]])
+row_ha <- rowAnnotation(sampletype=auc$sampletype,
+                        comparison=auc$comparison, sex=auc$sex,
+                        col = list(sampletype = c("airway"="#DEEBF7","BALF"="#9ECAE1","induced sputum"="#4292C6", "blood" = "red"),
+                                   comparison = c("healthyControls_vs_moderateAsthma"="#E69F00", "healthyControls_vs_severeAsthma"="#56B4E9", "moderateAsthma_vs_severeAsthma"="#009E73"),
+                                   sex = c("F"="#80CDC1","M"="#35978F","M+F"="#01665E")))
+
+h2 <- Heatmap(auc2, column_split = classifer,
+        right_annotation = row_ha, 
+        cluster_columns = TRUE,
+        border = TRUE, name="AUC",
+    cell_fun = function(j, i, x, y, width, height, fill) {
+        if(auc2[i, j] > 0.9) {
+          grid.text("***", x, y, gp = gpar(fontsize = 15))
+        } else if(auc2[i, j] > 0.8) {
+          grid.text("**", x, y, gp = gpar(fontsize = 15))
+        } else if(auc2[i, j] > 0.7) {
+          grid.text("*", x, y, gp = gpar(fontsize = 15))
+        }
+})
+h2
+```
+
+## Summarize model performance table (severity)
+
+```{r summarize_severity_model_performance}
+sevtable <- rbind(sev_rf$df[, col_names],
+             sev_plsda$df[, col_names]) %>% 
+  mutate(value = signif(value, 2)) %>%  
+  filter(stat == "AUC.mean") %>% 
+  spread(model, value) %>% 
+  filter(PLSDA > 0.7) %>% 
+  filter(RF > 0.7)
+write.csv(sevtable, here::here("results", "sev_models_perfs.csv"))
+
+sevtable %>% 
+  group_by(sampletype, comparison, sex) %>% 
+  summarise(count = n()) %>% 
+  spread(sampletype, count)
+```
+
+## Compile feature importance + rank summaries
+
+```{r compile_feature_importance_and_ranks}
+selectcols <- intersect(colnames(sev_plsda$feat), colnames(sev_rf$feat))
+sevfeat <- rbind(sev_plsda$feat[, selectcols], 
+                 sev_rf$feat[,selectcols]) %>% 
+  right_join(sevtable, by=c("gse", "comparison", "panel", "sex", "sampletype")) %>% 
+  dplyr::select(-c(stat, PLSDA, RF, gse)) %>% 
+  group_by(comparison, panel, sex, model, sampletype) %>%
+  mutate(rank_pct = percent_rank(importance))
+
+exacer_rank <- exacerfeat %>%
+  group_by(feature, comparison) %>%
+  summarise(
+   avg_rank = mean(rank_pct, na.rm = TRUE),
+   sd_rank = sd(rank_pct, na.rm = TRUE),
+   .groups   = "drop"
+  )
+sev_rank <- sevfeat %>%
+  group_by(feature, comparison, sampletype) %>%
+  summarise(
+   avg_rank = mean(rank_pct, na.rm = TRUE),
+   sd_rank = sd(rank_pct, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+```
+
+## Pathway annotation + pathway barplots (assigned/unassigned)
+
+```{r plot_pathway_importance_assigned_unassigned}
+# sev_rank is your tibble with feature, avg_rank, sd_rank
+
+# pick a KEGG library available in Enrichr
+dbs <- enrichR::listEnrichrDbs()
+kegg_db <- dbs$libraryName[grepl("KEGG", dbs$libraryName)][1]
+kegg_db
+# e.g. "KEGG_2021_Human" (depends on what's available)
+
+# run enrichr
+db <- "GO_Biological_Process_2025"
+enr <- enrichR::enrichr(latephase_biomarkers$all, databases = db)
+kegg <- enr[[db]]
+
+# keep significant-ish terms (tune as you like)
+kegg_sig <- kegg %>%
+  filter(Adjusted.P.value <= 0.1) %>%
+  arrange(Adjusted.P.value)
+
+# parse the "Genes" column from enrichr (overlapping genes per pathway)
+gene_path_long <- kegg_sig %>%
+  dplyr::select(Pathway = Term, padj = Adjusted.P.value, Genes) %>%
+  mutate(Genes = str_split(Genes, pattern = ";\\s*")) %>%
+  unnest(Genes) %>%
+  dplyr::rename(feature = Genes)
+
+# assign each gene to ONE pathway:
+# (the pathway with smallest adjusted p among those containing the gene)
+gene2path <- gene_path_long %>%
+  group_by(feature) %>%
+  slice_min(order_by = padj, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# attach pathway to your ranking table
+exacer_annot <- exacer_rank %>%
+  left_join(gene2path %>% dplyr::select(feature, Pathway), by = "feature") %>%
+  mutate(Pathway = ifelse(is.na(Pathway), "Unassigned", Pathway)) %>% 
+  mutate(sampletype = "PBMCs") %>% 
+  mutate(comparison = factor(comparison, c("Exacer vs. Quiet (Moderate Persistent)", "Exacer vs. Quiet (Severe Persistent)", "Exacer vs. followup (Moderate Persistent)", "Exacer vs. followup (Severe Persistent)")))
+exacer_annot %>% head()
+
+# attach pathway to your ranking table
+sev_annot <- sev_rank %>%
+  left_join(gene2path %>% dplyr::select(feature, Pathway), by = "feature") %>%
+  mutate(Pathway = ifelse(is.na(Pathway), "Unassigned", Pathway))
+sev_annot %>% head()
+```
+
+## Assemble multi-panel Figure 4
+
+```{r assemble_figure4_panels}
+p1_unassigned <- plot_varimp_pathways(
+  exacer_annot,
+  top_n = 30,
+  sum_threshold = 1.5,
+  include_unassigned = TRUE
+) + theme(legend.position = "top") +
+  scale_fill_manual(values = c("Exacer vs. Quiet (Moderate Persistent)"="#DEEBF7", "Exacer vs. Quiet (Severe Persistent)"="#9ECAE1", "Exacer vs. followup (Moderate Persistent)"="#4292C6", "Exacer vs. followup (Severe Persistent)"="#084594"))
+p1_unassigned
+p1_assigned <- plot_varimp_pathways(
+  exacer_annot,
+  top_n = 20,
+  sum_threshold = 1.5,
+  include_unassigned = FALSE
+) + theme(legend.position = "top") +
+  scale_fill_manual(values = c("Exacer vs. Quiet (Moderate Persistent)"="#DEEBF7", "Exacer vs. Quiet (Severe Persistent)"="#9ECAE1", "Exacer vs. followup (Moderate Persistent)"="#4292C6", "Exacer vs. followup (Severe Persistent)"="#084594"))
+p1_assigned
+p2_unassigned <- plot_varimp_pathways(
+  sev_annot,
+  top_n = 10,
+  sum_threshold = 2,
+  include_unassigned = TRUE
+) + theme(legend.position = "top") +
+  scale_fill_manual(values = c("healthyControls_vs_moderateAsthma"="#E69F00", "healthyControls_vs_severeAsthma"="#56B4E9", "moderateAsthma_vs_severeAsthma"="#009E73"))
+p2_unassigned
+p2_assigned <- plot_varimp_pathways(
+  sev_annot,
+  top_n = 10,
+  sum_threshold = 2,
+  include_unassigned = FALSE
+) + theme(legend.position = "top") +
+  scale_fill_manual(values = c("healthyControls_vs_moderateAsthma"="#E69F00", "healthyControls_vs_severeAsthma"="#56B4E9", "moderateAsthma_vs_severeAsthma"="#009E73"))
+p2_assigned
+ggsave(here("results", "Figure4b1.png"), plot = p1_unassigned, width = 3, height = 5)
+ggsave(here("results", "Figure4b2.png"), plot = p1_assigned, width = 12, height = 5)
+ggsave(here("results", "Figure4d1.png"), plot = p2_unassigned, width = 10, height = 5)
+ggsave(here("results", "Figure4d2.png"), plot = p2_assigned, width = 10, height = 5)
+```
+
+## save panels of Figure 4
+
+```{r}
+library(grid)
+library(patchwork)
+library(ComplexHeatmap)
+
+g1 <- grid.grabExpr(draw(h1, merge_legends = FALSE))
+g2 <- grid.grabExpr(draw(h2, merge_legends = FALSE))
+ggsave(here("results", "Figure4a.png"), plot = g1, width = 10, height = 5)
+ggsave(here("results", "Figure4b.png"), plot = p1_assigned, width = 10, height = 5)
+ggsave(here("results", "Figure4c.png"), plot = g2, width = 10, height = 7)
+ggsave(here("results", "Figure4d.png"), plot = p2_assigned, width = 10, height = 7)
+```
+
+## Check top transcripts in male panel
+
+```{r plot_top_male_panel_transcripts}
+
+male_features <- exacerfeat %>% 
+  ungroup() %>% 
+  group_by(feature, comparison) %>% 
+  filter(sex == "M") %>% 
+  summarise(avg = mean(rank_pct)) %>% 
+  arrange(desc(avg)) %>% 
+  ungroup() %>% 
+  group_by(comparison) %>% 
+  dplyr::slice(1:2) %>%
+  mutate(
+    severity = sub("^.*\\((.*)\\)\\s*$", "\\1", comparison)       # text inside ()
+  )
+
+plots <- mapply(function(x, y){
+    res = plot_gene_sex_lme(gene = x,
+           severity = y,
+           geoPanelGenes = geoPanelGenes,
+           phenoDataList = phenoDataList)
+  res$plot
+}, x = male_features$feature, y = male_features$severity)
+
+
+male_plots <- plot_grid(plotlist = plots)
+ggsave(here("results", "male_specific_biomarkers.png"), male_plots,
+       width = 10, height = 7)
+male_plots
+```
+
+# sessionInfo
+
+```{r}
+sessionInfo()
+```
+
